@@ -20,17 +20,17 @@ Comments and code in this file are used for describing and explaining a particul
 
 +++
 title = "Futures in Go, no package required"
-description = "With goroutines and channels, implementing Futures in Go is trivial."
+description = "How to trivially implement futures in Go using goroutines and channels"
 author = "Christoph Berger"
 email = "info@appliedgo.net"
-date = "2020-05-16"
+date = "2020-06-06"
 draft = "true"
 categories = ["Concurrent Programming"]
 tags = ["future", "goroutine", "channel"]
 articletypes = ["Tutorial"]
 +++
 
-Futures are mechanisms for decoupling a value from how it was computed. Goroutines and channels allow modeling futures trivially. Does this approach cover all aspects of a future?
+Futures are mechanisms for decoupling a value from how it was computed. Goroutines and channels allow implementing futures trivially. Does this approach cover all aspects of a future?
 
 <!--more-->
 
@@ -42,12 +42,12 @@ Recently I came across a short comment on Reddit:
 > peterbourgon (7.00/0.00): Futures in Go, no package required:
 >
 >    ```
->    c := make(chan int)         // future
+>    c := make(chan int)      // future
 >    go func() { c <- f() }() // async
 >    value := <-c             // await
 >    ```
 
-I got curious. Is this sufficient to model a future as known in other languages?
+I got curious. Is this sufficient to model a future as known in other languages? Or would advanced use cases still require a `futures` package for properly modeling futures semantics?
 
 
 ## Futures in a nutshell
@@ -64,36 +64,46 @@ Channel `c` is our future, a proxy for a result that may or may not be ready at 
 
 ### Part 2: Compute the value asynchronously.
 
-For this we set up and execute a goroutine. The main goroutine can continue doing other things until it needs a value from c.
+For this we set up and execute a goroutine. The main goroutine can continue doing other things until it needs the computed value from c.
 
-Let's define the channel as a parameter to the goroutine. The actual call then receives the channel we defined above as an argument.
+Deviating from the original code, let's define the channel as a parameter to the goroutine. The actual call then receives the channel we defined above as an argument. We can also pass input parameters as needed.
 
 ```go
-go func(res chan<- int) {
-    res <- f()
-}(c)
+go func(input int, result chan<- int) {
+    result <- input * 2 // Horribly complex and long-winded calculation
+}(1, c)
 ```
 
 ### Part 3: retrieve the computed value.
 
-Finally, at some point, the main goroutine requests the value. If the channel already contains a result, it can be read right away; otherwise, the statement blocks until the result is there.
+Finally, at some point, the main goroutine requests the value. If the channel already contains a result, it is retrieved right away; otherwise, the statement blocks until the result is there.
 
 ```go
 value := <-c
 ```
 
-Easy enough, right?
 
-Be careful, however. This code contains two implicit assumptions about how to compute and read a future.
+
+
+## A closer look
+
+The above code is easy enough, right?
+
+However, this code contains some implicit assumptions about how to compute and read a future.
 
 **Assumption #1:** It is ok that the spawned goroutine blocks after having calculated the result.
 
 **Assumption #2:** The reader reads the result only once.
 
+**Assumption #3:** The spawned goroutine provides a result within a reasonable time.
 
-### Let the spawned goroutine do more things
+All of these limiting assumptions can be addressed. And the best part is, the additional code required here is also trivial and makes use of well-known standard Go features.
 
-Assumption #1 allowed us to create a channel with zero length. The write operation `c <- f()` then blocks until a reader is ready to receive the value from the channel. This is perfectly fine if the goroutine's only job is to calculate the future's result. In most cases, this is exactly what we need.
+Let's have a look at each of them.
+
+### Let the spawned goroutine do more after computing the future
+
+Assumption #1 allows us to create a channel with zero length. The write operation `c <- f()` then blocks until a reader is ready to receive the value from the channel. This is perfectly fine if the goroutine's only job is to calculate the future's result. In most cases, this is exactly what we need.
 
 If, for some reason, calculation of the future is embedded in a broader context that is supposed to continue to run concurrently, simply use a channel of length 1 to store the result until the reader is ready to retrieve it:
 
@@ -103,81 +113,135 @@ c := make(chan int, 1)
 
 Now the spawned goroutine can pass the result to the channel and continue immediately, maybe computing other futures that depend on the one just delivered. Or doing cleanup or whatever.
 
-### Make the read operation idempotent
+However, here lies a catch: On a single-core CPU where the concurrent execution cannot be effectively parallelized, the computing goroutine may block the reading goroutine while it continues computing things.
 
-Assumption #2 is also just fine in most cases. However, what if a package API expose a future to clients? Other people's code is usually impossible to control, so we should take measures to ensure that the result can be safely read multiple times. (In other words, the read operation should be *idempotent*.)
+### Read the computed future more than once
 
-Again, this is trivial in Go. We even have several approaches to choose from.
+Assumption #2 is also just fine in most cases. However, sometimes you might have multiple goroutines that shall receive the computed value.
 
-### Read only once with sync.Once
-
-We can make use of the `sync` package here and define a `Once` function.
+Again, this is trivial in Go. We only need to make the computing goroutine send the result to the channel over and over again.
 
 ```go
-var future int
-o := sync.Once{}  // Create a Once struct
-get := func() int {
-	o.Do(func() { future = <-c }) // This func is called only once for the lifetime of `o`.
-	return future
-}
-```
-
-To be honest, I do not like this approach and would not use it myself.
-
-Two reasons:
-1. One more dependency on a package (albeit from the standard library)
-2. The trickery around returning the value
-
-Luckily, there is another approach available.
-
-### Provide the computed value over and over again
-
-When the calculating goroutine provides the result as often as we need it, then we can keep the receiving side as simple as in the original approach.
-
-The change to the goroutine is also very simple. We only need to add an infinite loop for feeding the result to the channel.
-
-```go
-go func(res chan<- int) {
+go func(input int, result chan<- int) {
 	// calculate...
 	for {
-		res <- 4096
+		result <- 4096
 	}
 }(c)
 ```
 
-On the consuming side, the code is again as easy as reading from a channel.
+On the consuming side, noting needs to change. We can repeatedly reading from the channel and get the same value back, once it has been computed.
 
 ```go
-value = <-c
-value = <-c  // Read again, get the same value again
+value1 := <-c
+value2 := <-c  // Read again, get the same value again
 ```
 
-### Close a channel when work is done
+And in case you wonder -- no, there is no busy-looping happening here. The loop blocks on every attempt to write to the channel until a reader retrieves a value from the channel.
 
-The technique we use here is a Go idiom that makes use of the fact that a closed channel dispenses the zero value of its element type on every read attempt. Here is how it works:
 
-1. An unbuffered channel is shared between sender and receiver.
-2. The reader attempts to read from the channel and blocks.
-3. When the sender is ready to share the result, it simply closes the channel.
-4. The closed channel dispenses a zero value. This unblocks the reader.
-5. Now the reader can read the calculated value.
-6. If the reader tests the channel again, it will not block as the channel continues to dispense the zero value.
 
-Using this concept, our future looks as follows.
+### Limit the time to wait for the future
+
+In some cases it is better to not rely on the goroutine to provide a value in time. For example, the algorithm to compute the future might be of exponential time complexity, and the caller might have passed an input that causes the result to take ages to compute. Or the future might be calculated by calling a remote function over a slow and/or unreliable network.
+
+Obviously, we need to be able to set an upper limit for the time to wait for the result. Again, this is quite easy: Go provides *contexts* to equip goroutines with a timeout.
+
+This time we need to change the caller/reader side. The computing goroutine can remain unchanged.
+
+To be able to watch for both the result of the future and a timeout, we define a `get()` function to retrieve the value. Inside the function, a `select` statement observes both the result channel and a timer that we start by calling `time.After()`. This method returns a channel upon calling, and sends the current time through that channel when the time is up. We do not need that time, so the result is discarded.
+
+When the timer triggers, we need to indicate failure to the caller. For this, we can add a second return parameter that turns true if a timeout occurs.
 
 ```go
-
+	get := func(s int) (result int, timedout bool) {
+		select {
+		case result = <-c3:
+			return result, false
+		case <-time.After(time.Duration(s) * time.Second):
+			return 0, true
+		}
+	}
 ```
+
+To retrieve the future, call `get()`, pass the desired timeout (in seconds), and test the boolean:
+
+```go
+value, timedOut := get(1)
+if timedOut {
+	...
+}
+```
+
+## More "futureness"
+
+Futures in other languages usually have a couple more methods as the authors strived to cover every imaginable use case. You do not need those at all costs. If you do, here are suggestions for mapping these methods to Go features.
+
+Note that I have not added the code snippets from this section to the main code listing below. I feel that adding too much fine-grained control can easily lead to over-engineered code and tight coupling between goroutines. However, as there might be use cases, I discuss them here briefly and leave the implementation as an exercise for the reader.
+
+
+### Cancel the computing goroutine
+
+In some situations, a future may become obsolete before it has been fully computed. To save resources, the computing goroutine should be canceled then.
+
+Here, the `context` package comes in handy. A context is an object that provides canceling, deadline, and timeout functionalities to goroutines. For canceling a goroutine, create a Background context and add the Cancel option.
+
+```go
+ctx, cancel := context.WithCancel(context.Background())
+```
+
+Pass the `ctx` object to the goroutine. The second return value, `cancel`,  is a function. When the goroutine is not needed, call this function to request the goroutine to cancel itself.
+
+How does this work?
+
+The context object contains a `done` channel. This channel delivers no values as long as it is open. Hence reading from the channel blocks the reader as long as the channel is open. Calling `cancel()` closes this channel. A closed channel starts delivering the zero value of its element type, and so any reader unblocks and can invoke code for cleaning up and exiting the goroutine.
+
+To implement this inside the computing goroutine, execute a select statement in a loop. Make the select watch for the `done` channel to get closed. As long as the `done` channel is open, any read operation blocks because the `done` channel does not deliver anything. Hence the select statement skips this case block and evaluates other `case` blocks instead.
+
+```go
+go func(ctx context.Context) {
+	// compute the future
+	for {
+		select {
+		case <-ctx.Done():
+			// cleanup code here
+			return
+		case default:
+			// compute the future
+		}
+	}
+}(ctx)
+```
+
+This concept can be extended to multiple goroutines that compute the same future. When the fastest computation finishes, all other computing goroutines can be canceled via the `done` channel.
+
+
+## Have the computing goroutine time out
+
+The above mechanism can as well be used for having the computing goroutine time out. This is an improved version of the above approach, where we only unblocked the reader after the time out. With a context, we can cancel the computing goroutine itself and thus stop it from further consuming CPU time or other resources. The `WithTimeout()` method of a `Context` object creates the same `done` channel as the `WithCancel()` method, and even returns a `cancel` function that can be called, but in addition, the `done` channel is also closed when the passed-in time has elapsed.
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 10 * time.Second)
+```
+
+### More control?
+
+There are even more ways of interacting with the computation of a future. For example, [jQuery's Deferred Object](https://api.jquery.com/category/deferred-object/) provides methods for chaining, notifications, progress notifications, state inspection, and other bells and whistles. If you have a closer look at them, I am sure you will find ways of implementing these methods via channels, waitGroups, or contexts.
+
+However, as said above, don't over-engineer your code. If you feel the need to have your goroutines micro-manage each other using a truckload of methods for inspection and manipulation, this might be a good opportunity to re-think your overall concurrency design. Chances are that you will find a cleaner way that is more manageable and in the end also easier to reason about.
+
+And back to my initial question: Would you be better off with a futures package? I see two possible reasons for using a package rather than native Go features: convenience, and domain-specific semantics. A convenience package can provide methods and objects that might help you switching from some other language to Go. And if you develop code for a specific problem domain, then a domain-specific API can "talk" to you in the language of that problem domain and avoid having to jump between different levels of abstraction. Neither of the two reasons is really life-saving, so it is a matter of personal (or team) preference whether to use a package or to stick to native Go features. Tip: start with the latter and only switch to a convenience or domain-specific package if they help managing complexity in your specific situation.
 
 ## The code
+
+The code below contains all of the above in one single, executable file. Feel free to use it for your own experiments.
 */
 
-// ## Imports and globals
+// ## The basics
 package main
 
 import (
 	"fmt"
-	"sync"
 	"time"
 )
 
@@ -189,12 +253,12 @@ func main() {
 	fmt.Println("---------------\n")
 
 	// This goroutine receives a channel, does some calculation, and writes the result to the channel.
-	go func(res chan<- int) {
+	go func(input int, result chan<- int) {
 		fmt.Println("Calculating")
 		time.Sleep(1 * time.Second)
 		fmt.Println("done")
-		res <- 1024
-	}(c)
+		result <- input * 2
+	}(1, c)
 
 	// Read the future by receiving its value from the channel.
 	var value int
@@ -203,107 +267,77 @@ func main() {
 	value = <-c
 	fmt.Println("got", value)
 
-	fmt.Println("\nMultiple reads with sync.Once")
+	// ## Read the future multiple times
+
+	fmt.Println("\nReading the future multiple times")
 	fmt.Println("-----------------------------\n")
 
-	// `sync.Once{}` provides a method `Do()` that receives a function and executes the function only once. Subsequent calls to the same function only return a cached result.
-	o := sync.Once{}
-
-	// `Do()` does not return anything, so we need a variable to store the result of the call.
-	var future int
-
-	// `get()` wraps the call to `Do()`.
-	get := func() int {
-		// `Do()` calls an anonymous func that reads the future from channel c.
-		o.Do(func() { future = <-c })
-		// Trick return! This function acts like a closure and therefore has access to the outer scope.
-		return future
-	}
-
-	// The calculating goroutine is the same as before.
-	go func(res chan<- int) {
-		fmt.Println("Calculating")
-		time.Sleep(1 * time.Second)
-		fmt.Println("Writing result")
-		res <- 2048
-	}(c)
-
-	// Instead of reading the channel, we now call `get()`.
-	fmt.Println("Waiting")
-	value = get()
-	fmt.Println("got", value)
-	value = get()
-	fmt.Println("got", value)
-
-	fmt.Println("\nMultiple reads from a channel that never dries up")
-	fmt.Println("-------------------------------------------------\n")
+	c2 := make(chan int)
 
 	// We modify the calculating goroutine a bit. After calculating the result, the goroutine goes into an infinite loop to pass the result to the channel as often as some other code wants to read it. Note that this is not a busy loop, as each iteration blocks until the channel is free to write to.
-	go func(res chan<- int) {
+	go func(input int, res chan<- int) {
 		fmt.Println("Calculating")
 		time.Sleep(1 * time.Second)
 		for {
 			fmt.Println("Writing result")
-			res <- 4096
+			res <- input * 4
 		}
-	}(c)
+	}(1, c2)
 
 	// Now we can read repeatedly from the channel and get the same result as often as we want.
 	fmt.Println("Waiting")
-	fmt.Println("got", <-c)
-	fmt.Println("got", <-c)
-	//	fmt.Println("got", <-c)
+	fmt.Println("got", <-c2)
+	fmt.Println("got", <-c2)
 
-	fmt.Println("\nUsing a 'done' channel")
-	fmt.Println("----------------------\n")
+	// ## Read with a timeout
 
-	// Create a channel only for the purpose of closing it. The type can be anything.
-	done := make(chan bool)
+	fmt.Println("\nReading with a timeout")
+	fmt.Println("-----------------------------\n")
 
-	// Can you imagine why we need this Sleep() call here?
-	time.Sleep(1 * time.Millisecond)
+	c3 := make(chan int)
 
-	// The calculating goroutine receives the done channel, writes the result directly into `value`, and closes the channel.
-	// In general, having a goroutine write into a value defined outside is really bad practice, as it is prone to race conditions if multiple goroutines can write to that variable. However, here we definitely have only one goroutine, so for the sake of simplicity I'll leave it that way.
-	go func(d chan<- bool) {
+	// The computing goroutine can remain unchanged.
+	go func(input int, res chan<- int) {
 		fmt.Println("Calculating")
-		time.Sleep(1 * time.Second)
-		fmt.Println("Writing result")
-		value = 8192
-		close(d)
-	}(done)
+		time.Sleep(2 * time.Second)
+		for {
+			fmt.Println("Writing result")
+			res <- input * 8
+		}
+	}(1, c3)
 
-	// Readers must test the `done` channel before accessing the value.
+	// The select statement allows reading from multiple channels simultaneously. Here, we use it to block until either the future is ready to read or the timer triggers, whichever happens first.
+	get := func(s int) (result int, timedout bool) {
+		select {
+		case result = <-c3:
+			return result, false
+		case <-time.After(time.Duration(s) * time.Second):
+			return 0, true
+		}
+	}
+
 	fmt.Println("Waiting")
-	<-done
-	fmt.Println("got", value)
-	<-done
-	fmt.Println("got", value)
-
+	result, timedOut := get(1)
+	if timedOut {
+		// Handle the timeout.
+		fmt.Println("Timed out")
+		return
+	}
+	fmt.Println(result)
 }
 
 /*
 ## How to get and run the code
 
-Step 1: `go get` the code. Note the `-d` flag that prevents auto-installing
-the binary into `$GOPATH/bin`.
+Step 1: clone the repository.
 
-    go get -d github.com/appliedgo/TODO:
+    git clone github.com/appliedgo/futures
 
-Step 2: `cd` to the source code directory.
+Step 2: `cd` to the source code directory and run the code.
 
-    cd $GOPATH/src/github.com/appliedgo/TODO:
+    go run futures.go
 
-Step 3. Run the binary.
-
-    go run TODO:.go
-
-
-## Odds and ends
-## Some remarks
-## Tips
-## Links
-
+Or run the code directly in the [Go Playground](https://play.golang.org/p/gyLQb5mMKl_V).
 
 **Happy coding!**
 
