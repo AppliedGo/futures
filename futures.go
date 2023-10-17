@@ -123,11 +123,11 @@ Again, this is trivial in Go. We only need to make the computing goroutine send 
 
 ```go
 go func(input int, result chan<- int) {
-	// calculate...
+	value := compute(input)
 	for {
-		result <- 4096
+		result <- value
 	}
-}(c)
+}(256, c)
 ```
 
 On the consuming side, noting needs to change. We can repeatedly reading from the channel and get the same value back, once it has been computed.
@@ -340,5 +340,11 @@ Step 2: `cd` to the source code directory and run the code.
 Or run the code directly in the [Go Playground](https://play.golang.org/p/gyLQb5mMKl_V).
 
 **Happy coding!**
+
+___
+
+Changelog
+
+2023-10-17 Small improvements to the code for "Read the future more than once"
 
 */
